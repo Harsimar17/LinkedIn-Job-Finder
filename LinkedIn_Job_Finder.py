@@ -25,7 +25,7 @@ from urllib.parse import urlencode
 import requests
 from bs4 import BeautifulSoup
 
-JOB_COUNT   = 200                    # total jobs to collect 
+JOB_COUNT   = 10                    # total jobs to collect 
 OUTPUT_FILE = "linkedin_jobs.csv"
 
 # Paste your LinkedIn "li_at" session cookie value here.
@@ -69,7 +69,8 @@ def build_params(keyword: str, location: str, start: int, seconds) -> dict:
     return {
         "keywords": keyword,
         "location": location,
-        "f_TPR":seconds
+        "f_TPR":seconds,
+        "start": start
     }
 
 
@@ -91,6 +92,7 @@ def _parse_jobs_from_json(soup: BeautifulSoup) -> list[Job]:
     import json, re
 
     jobs: list[Job] = []
+    seen_urls: set[str] = set()
     for code_tag in soup.find_all("code"):
         raw = code_tag.get_text()
         if '"jobTitle"' not in raw and '"title"' not in raw:
@@ -136,7 +138,8 @@ def _parse_jobs_from_json(soup: BeautifulSoup) -> list[Job]:
                 if job_id_match else ""
             )
 
-            if title:
+            if title and job_url not in seen_urls:
+                seen_urls.add(job_url)
                 jobs.append(Job(title, company, location, str(date_posted), "N/A", job_url))
 
     return jobs
@@ -173,37 +176,63 @@ def parse_jobs(html: str) -> list[Job]:
 
     return jobs
 
-
 def fetch_applicants(job_url: str) -> str:
     """Fetch the job detail page and extract the applicant count."""
+    if not job_url:
+        return "N/A"
+    import json, re
     try:
         resp = SESSION.get(job_url, timeout=15)
         if resp.status_code != 200:
             return "N/A"
         soup = BeautifulSoup(resp.text, "html.parser")
-        tag = soup.find("figcaption", class_="num-applicants__caption")
-        print(tag.get_text(strip=True))
-        return tag.get_text(strip=True) if tag else "N/A"
+
+        # Authenticated page: applicant count is in embedded JSON
+        APPLICANT_KEYS = (
+            "applicantCountText", "formattedApplicantCount",
+            "numApplicants", "clickedApplyText", "applyClickCount",
+        )
+        for code_tag in soup.find_all("code"):
+            raw = code_tag.get_text()
+            if not any(k in raw for k in ("applicant", "clicked apply", "clickedApply")):
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for item in (data.get("included") or [data]):
+                if not isinstance(item, dict):
+                    continue
+                for key in APPLICANT_KEYS:
+                    val = item.get(key)
+                    if val:
+                        return str(val).strip()
+
+        # Unauthenticated fallback: plain HTML
+        tag = soup.find("span", class_=re.compile(r"num-applicants"))
+        if tag:
+            return tag.get_text(strip=True)
+
+        # Generic text search as last resort — covers all known LinkedIn phrasings:
+        #   "247 applicants"  |  "Over 200 applicants"
+        #   "25 people clicked apply"  |  "Over 100 people clicked apply"
+        #   "Be among the first 25 applicants"
+        _PATTERN = re.compile(
+            r"(?:"
+            r"[Oo]ver\s+[\d,]+\s*(?:people\s+clicked\s+apply|applicants?)"
+            r"|[\d,]+\+?\s*(?:people\s+clicked\s+apply|applicants?)"
+            r"|[Bb]e among the first\s+[\d,]+\s*applicants?"
+            r")",
+            re.IGNORECASE,
+        )
+        match = _PATTERN.search(resp.text)
+        if match:
+            return match.group(0).strip()
+
     except requests.RequestException:
-        return "N/A"
+        pass
+    return "N/A"
 
-
-def enrich_applicants(jobs: list[Job]) -> list[Job]:
-    """Fetch applicant counts for all jobs from their detail pages."""
-    print(f"\nFetching applicant counts for {len(jobs)} jobs…")
-    for i, job in enumerate(jobs, 1):
-        count = fetch_applicants(job.job_url)
-        try:
-            act_cont = count.split(" ")
-            if int(act_cont[1]) < 100:
-                print()
-        except:
-            print(count)
-        
-        job.applicants = count
-        print(f"  [{i}/{len(jobs)}] {job.title[:40]:<42} → {count}")
-        time.sleep(random.uniform(1.0, 2.5))
-    return jobs
 
 def save_csv(jobs: list[Job], filename: str):
     file_exists = os.path.exists(filename) and os.path.getsize(filename) > 0
@@ -231,7 +260,13 @@ def print_table(jobs: list[Job]):
         )
     print(f"{line}\nTotal: {len(jobs)} jobs\n")
 
-
+def extract_applicant_count(applicant_str: str) -> int:
+    """Return the numeric applicant count, or -1 if unparseable."""
+    import re
+    match = re.search(r"[\d,]+", applicant_str)
+    if not match:
+        return -1
+    return int(match.group(0).replace(",", ""))
 def main():
     LOCATION = str(input("Enter for which location you want job postings : \n"))
     JOB_ROLE = str(input("Enter Job Role: \n"))
@@ -239,6 +274,7 @@ def main():
     print(f"Target: {JOB_COUNT} jobs\n")
 
     all_jobs: list[Job] = []
+    seen_urls: set[str] = set()
     start = 0
     try:
         hours = float(input("Enter for how much hours you want job postings: "))
@@ -263,19 +299,29 @@ def main():
             print("no jobs found — end of results or blocked.")
             break
 
-        print(f"{len(page_jobs)} jobs found.")
-        all_jobs.extend(page_jobs)
-        start += 25
+        print(f"{len(page_jobs)} jobs found — checking applicant counts…")
+        for job in page_jobs:
+            if job.job_url in seen_urls:
+                continue
+            seen_urls.add(job.job_url)
+            print(f"    {job.title[:40]}…", end=" ", flush=True)
+            job.applicants = fetch_applicants(job.job_url)
+            count = extract_applicant_count(job.applicants)
+            print(f"{job.applicants} → ", end="")
+            if count != -1 and count < 100:
+                all_jobs.append(job)
+                print(f"kept ({len(all_jobs)}/{JOB_COUNT})")
+            else:
+                print("skipped")
 
-        # Polite delay to avoid rate-limiting
-        time.sleep(random.uniform(2.0, 4.0))
+        start += 25
 
     all_jobs = all_jobs[:JOB_COUNT]
     if all_jobs:
         print_table(all_jobs)
-        save_csv( all_jobs, OUTPUT_FILE)
+        save_csv(all_jobs, OUTPUT_FILE)
     else:
-        print("No jobs found. Try different keywords or check your internet connection.")
+        print("No jobs found under 100 applicants. Try different keywords or check your connection.")
 
 if __name__ == "__main__":
     main()
