@@ -25,13 +25,8 @@ from urllib.parse import urlencode
 import requests
 from bs4 import BeautifulSoup
 
-# ──────────────────────────────────────────────────
-#  CONFIGURE THESE
-# ──────────────────────────────────────────────────
-JOB_ROLE    = "Java Developer"   # e.g. Java Developer
-LOCATION    = "India"       # e.g. "India
 JOB_COUNT   = 200                    # total jobs to collect 
-OUTPUT_FILE = "linkedin_jobs_bs4.csv"
+OUTPUT_FILE = "linkedin_jobs.csv"
 
 # Paste your LinkedIn "li_at" session cookie value here.
 # Leave as "" to fall back to unauthenticated (public) scraping.
@@ -78,7 +73,7 @@ def build_params(keyword: str, location: str, start: int, seconds) -> dict:
     }
 
 
-def fetch_page(start: int, seconds) -> str | None:
+def fetch_page(start: int, seconds, LOCATION, JOB_ROLE) -> str | None:
     params = build_params(JOB_ROLE, LOCATION, start, seconds)
     url = "https://www.linkedin.com/jobs/search/?" + urlencode(params)
     try:
@@ -238,6 +233,8 @@ def print_table(jobs: list[Job]):
 
 
 def main():
+    LOCATION = str(input("Enter for which location you want job postings : \n"))
+    JOB_ROLE = str(input("Enter Job Role: \n"))
     print(f"Searching LinkedIn for: '{JOB_ROLE}' in '{LOCATION}'")
     print(f"Target: {JOB_COUNT} jobs\n")
 
@@ -255,7 +252,7 @@ def main():
         print(f"Invalid input: {e}")
     while len(all_jobs) < JOB_COUNT:
         print(f"  Fetching page at offset {start}…", end=" ", flush=True)
-        html = fetch_page(start, seconds)
+        html = fetch_page(start, seconds, LOCATION, JOB_ROLE)
 
         if not html:
             print("stopping early due to error.")
